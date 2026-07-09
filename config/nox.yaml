@@ -1,0 +1,50 @@
+#Yaml file containing dashboard configuration for NOx
+
+Instrument_Type: NOx
+
+Header: "IgorTime,Concentration_NOx,Concentration_NO2,Concentration_NO,Loss_NOx,Loss_NO2,Pressure,Temperature,Signal_NOx,Signal_NO2,Baseline_NOx,Baseline_NO2,Cal_NOx,Cal_NO2,Status,Status2,Timestamp"
+
+# Per-column units. Columns sharing a unit share a y-axis in the dashboard;
+# columns not listed here fall back to name-based inference in app.py.
+Units:
+  Concentration_NOx: "ppb"
+  Concentration_NO2: "ppb"
+  Concentration_NO: "ppb"
+  Loss_NOx: "Mm<sup>-1</sup>"
+  Loss_NO2: "Mm<sup>-1</sup>"
+  Baseline_NOx: "Mm<sup>-1</sup>"
+  Baseline_NO2: "Mm<sup>-1</sup>"
+  Pressure: "Torr"
+  Temperature: "K"
+  Signal_NOx: "counts"
+  Signal_NO2: "counts"
+  Cal_NOx: "Mm<sup>-1</sup> ppb<sup>-1</sup>"
+  Cal_NO2: "Mm<sup>-1</sup> ppb<sup>-1</sup>"
+  Status: ""
+  Status2: ""
+
+Main_Plots:
+  - Concentration_NO2
+  - Concentration_NOx
+
+# Rows whose Status_col value starts with Baseline_status_prefix are baseline
+# periods (both cells share one valve, so Status drives detection for both).
+# Each cell's Status_col (last digit) selects that cell's LED wavelength.
+Baseline_Recalculation:
+  Status_col: "Status"
+  Temperature_col: "Temperature"
+  Pressure_col: "Pressure"
+  Baseline_status_prefix: "32"
+  Baseline_sd_filter: 0.3   # Mm-1; discard baseline periods with noisier loss
+  IQR_multiplier: 1.5       # outlier cut inside each baseline period
+  Cells:
+    NO2:
+      Status_col: "Status"
+      Loss_col: "Loss_NO2"
+      Span_col: "Cal_NO2"
+      Concentration_col: "Concentration_NO2"
+    NOx:
+      Status_col: "Status2"
+      Loss_col: "Loss_NOx"
+      Span_col: "Cal_NOx"
+      Concentration_col: "Concentration_NOx"

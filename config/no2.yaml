@@ -1,0 +1,38 @@
+#Yaml file containing dashboard configuration for NO2
+
+Instrument_Type: NO2
+
+Header: "IgorTime,Concentration,Loss,Pressure,Temperature,Signal,Span,Status,LastBaseline,Timestamp"
+
+# Per-column units. Columns sharing a unit share a y-axis in the dashboard;
+# columns not listed here fall back to name-based inference in app.py.
+Units:
+  Concentration: "ppb"
+  Loss: "Mm<sup>-1</sup>"
+  LastBaseline: "Mm<sup>-1</sup>"
+  Pressure: "Torr"
+  Temperature: "K"
+  Signal: "counts"
+  Span: ""
+  Status: ""
+
+Main_Plots:
+  - Concentration
+  - LastBaseline
+
+# Rows whose Status_col value starts with Baseline_status_prefix are baseline
+# periods. Each cell's Status_col (last digit) selects the LED wavelength;
+# cells without their own Status_col use the instrument-level one.
+Baseline_Recalculation:
+  Status_col: "Status"
+  Temperature_col: "Temperature"
+  Pressure_col: "Pressure"
+  Baseline_status_prefix: "32"
+  Baseline_sd_filter: 0.3   # Mm-1; discard baseline periods with noisier loss
+  IQR_multiplier: 1.5       # outlier cut inside each baseline period
+  Cells:
+    NO2:
+      Loss_col: "Loss"
+      Span_col: "Span"
+      Concentration_col: "Concentration"
+

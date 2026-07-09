@@ -1,0 +1,25 @@
+#Yaml file containing dashboard configuration for SSA
+
+Instrument_Type: SSA
+
+Header: "IgorTime,Extinction,Scattering,Loss,Pressure,Temperature,Signal,LossRef,Status,WC,SignalRef,RawScatRef,RawScat,SDR,WCRef,Timestamp"
+
+Units:
+  Extinction: "Mm<sup>-1</sup>"
+  Scattering: "Mm<sup>-1</sup>"
+  Loss: "Mm<sup>-1</sup>"
+  Pressure: "Torr"
+  Temperature: "K"
+  Signal: "counts"
+  LossRef: "Mm<sup>-1</sup>"
+  Status: ""
+  WC: ""
+  SignalRef: "counts"
+  RawScatRef: "counts"
+  RawScat: "counts"
+  SDR: ""
+  WCRef: ""
+
+Main_Plots:
+  - Extinction
+  - Scattering

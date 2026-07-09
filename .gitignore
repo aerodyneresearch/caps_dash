@@ -1,0 +1,13 @@
+# Virtual environment — recreate from requirements.txt
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Streamlit secrets (never commit credentials)
+.streamlit/secrets.toml
+
+# OS cruft
+Thumbs.db
+.DS_Store

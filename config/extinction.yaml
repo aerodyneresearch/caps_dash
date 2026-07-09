@@ -1,0 +1,19 @@
+#Yaml file containing dashboard configuration for extinction
+
+Instrument_Type: Extinction
+
+Header: "IgorTime,Extinction,Loss,Pressure,Temperature,Signal,Span,Status,LastBaseline,Timestamp"
+
+Units:
+  Extinction: "Mm<sup>-1</sup>"
+  Loss: "Mm<sup>-1</sup>"
+  Pressure: "Torr"
+  Temperature: "K"
+  Signal: "counts"
+  Span: "Mm<sup>-1</sup>"
+  Status: ""
+  LastBaseline: ""
+
+Main_Plots:
+  - Extinction
+  - Loss
