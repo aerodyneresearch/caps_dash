@@ -40,6 +40,9 @@ Baseline_Recalculation:
   Temperature_col: "Temperature"
   Pressure_col: "Pressure"
   Baseline_status_prefix: "32"
+  # Valve-transition (flush) rows: zero-air contaminated but not baseline.
+  # 11xxx = entering baseline, 31xxx = leaving it.
+  Flush_status_prefixes: ["31", "11"]
   Baseline_sd_filter: 0.3   # Mm-1; discard baseline periods with noisier loss
   IQR_multiplier: 1.5       # outlier cut inside each baseline period
   Cells:

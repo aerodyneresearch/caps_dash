@@ -182,22 +182,60 @@ def recalculate_concentration(
     return df.with_columns(conc.alias(name))
 
 
+def recalculate_extinction(
+    df: pl.DataFrame,
+    loss_col: str,
+    rayleigh_col: str,
+    species: str,
+    interp: bool,
+    span: pl.Expr | None = None,
+) -> pl.DataFrame:
+    """Aerosol monitors (PMex, PMssa): corrected loss divided by the cell's
+    span calibration factor, in Mm^-1 — no mixing-ratio conversion."""
+    baseline_col = f"LastBaseline_{loss_col}_recalc" + ("_interp" if interp else "")
+    name = f"{species}_recalc" + ("_interp" if interp else "")
+    ext = (pl.col(loss_col) - pl.col(rayleigh_col)) - pl.col(baseline_col)
+    if span is not None:
+        ext = ext / span
+    return df.with_columns(ext.alias(name))
+
+
+def recalc_interp_col(settings: dict[str, Any] | None, species: str) -> str:
+    """Name of the interpolated-baseline output column for a cell, by method."""
+    method = str((settings or {}).get("Method", "gas")).lower()
+    if method == "extinction":
+        return f"{species}_recalc_interp"
+    return f"concentration_{species}_interp"
+
+
 def baseline_recalc(
     df: pl.DataFrame,
     *,
     status_col: str,
     loss_col: str,
-    span_col: str,
     temperature_col: str,
     pressure_col: str,
     species: str,
+    span_col: str | None = None,
+    span_value: float | None = None,
+    method: str = "gas",
     led_status_col: str | None = None,
     prefix: str = DEFAULT_BASELINE_STATUS_PREFIX,
+    flush_prefixes: tuple[str, ...] = (),
     sd_filter: float = DEFAULT_BASELINE_SD_FILTER,
     iqr_multiplier: float = DEFAULT_IQR_MULTIPLIER,
 ) -> pl.DataFrame:
     """Run the full recalculation pipeline for one measurement cell."""
     df = assign_baseline_period(df, status_col, prefix)
+    # flush_period marks valve-transition rows (zero-air contaminated but not
+    # baseline); it plays no role in the recalculation math itself.
+    if flush_prefixes:
+        flush = pl.any_horizontal(
+            [_is_baseline(status_col, p) for p in flush_prefixes]
+        )
+    else:
+        flush = pl.lit(False)
+    df = df.with_columns(flush.cast(pl.Int8).alias("flush_period"))
     df = assign_baseline_number(df)
     flag_col = f"baseline_good_{species}"
     df = flag_bad_baselines(df, loss_col, species, sd_filter)
@@ -221,13 +259,34 @@ def baseline_recalc(
         ) from None
     df, rayleigh_col = assign_rayleigh(df, led_status_col or status_col, temperature_col, pressure_col)
     df = recalculate_baseline_loss(df, loss_col, rayleigh_col, iqr_multiplier)
-    df = recalculate_concentration(
-        df, loss_col, span_col, rayleigh_col, temperature_col, pressure_col, species, interp=False
-    )
+
+    if method == "extinction":
+        if span_col:
+            span = pl.col(span_col)
+        elif span_value is not None:
+            span = pl.lit(float(span_value))
+        else:
+            span = None
+
+        def output_stage(frame: pl.DataFrame, interp: bool) -> pl.DataFrame:
+            return recalculate_extinction(
+                frame, loss_col, rayleigh_col, species, interp, span=span
+            )
+    elif method == "gas":
+        if not span_col:
+            raise BaselineError(f"Cell {species!r}: the gas method requires Span_col")
+
+        def output_stage(frame: pl.DataFrame, interp: bool) -> pl.DataFrame:
+            return recalculate_concentration(
+                frame, loss_col, span_col, rayleigh_col, temperature_col, pressure_col,
+                species, interp,
+            )
+    else:
+        raise BaselineError(f"Unknown Baseline_Recalculation Method {method!r}")
+
+    df = output_stage(df, interp=False)
     df = baseline_interpolation(df, f"LastBaseline_{loss_col}_recalc")
-    df = recalculate_concentration(
-        df, loss_col, span_col, rayleigh_col, temperature_col, pressure_col, species, interp=True
-    )
+    df = output_stage(df, interp=True)
     return df.with_columns(all_period, all_number)
 
 
@@ -272,13 +331,21 @@ def baseline_period_stats(
 
 
 def apply_baseline_recalc(
-    df: pl.DataFrame, config: dict[str, Any] | None, sd_filter: float | None = None
+    df: pl.DataFrame,
+    config: dict[str, Any] | None,
+    sd_filter: float | None = None,
+    parameters: list[str] | None = None,
 ) -> pl.DataFrame:
-    """Run baseline_recalc for every cell declared in the instrument config."""
+    """Run baseline_recalc for every cell declared in the instrument config.
+
+    parameters is the file's raw metadata parameter block, used when a cell
+    declares Span_parameter_index (1-indexed) instead of a span column.
+    """
     settings = (config or {}).get("Baseline_Recalculation") or {}
     cells = settings.get("Cells")
     if not cells:
         raise BaselineError("Config has no Baseline_Recalculation.Cells section")
+    method = str(settings.get("Method", "gas")).lower()
     required = [settings.get("Status_col"), settings.get("Temperature_col"), settings.get("Pressure_col")]
     for cell in cells.values():
         required += [cell.get("Loss_col"), cell.get("Span_col"), cell.get("Status_col")]
@@ -290,17 +357,39 @@ def apply_baseline_recalc(
             "file uses different column names than the config expects."
         )
 
+    raw_flush = settings.get("Flush_status_prefixes") or []
+    if not isinstance(raw_flush, (list, tuple)):
+        raw_flush = [raw_flush]
+    flush_prefixes = tuple(str(p) for p in raw_flush)
+
     for species, cell in cells.items():
+        span_value = cell.get("Span_value")
+        if (idx := cell.get("Span_parameter_index")) is not None:
+            if not parameters or len(parameters) < int(idx):
+                raise BaselineError(
+                    f"Cell {species!r}: Span_parameter_index {idx} but the file's "
+                    f"parameter block has only {len(parameters or [])} tokens"
+                )
+            try:
+                span_value = float(parameters[int(idx) - 1])
+            except ValueError:
+                raise BaselineError(
+                    f"Cell {species!r}: parameter-block token {idx} "
+                    f"({parameters[int(idx) - 1]!r}) is not a number"
+                ) from None
         df = baseline_recalc(
             df,
             status_col=settings["Status_col"],
             led_status_col=cell.get("Status_col"),
             loss_col=cell["Loss_col"],
-            span_col=cell["Span_col"],
+            span_col=cell.get("Span_col"),
+            span_value=span_value,
+            method=method,
             temperature_col=settings["Temperature_col"],
             pressure_col=settings["Pressure_col"],
             species=species,
             prefix=str(settings.get("Baseline_status_prefix", DEFAULT_BASELINE_STATUS_PREFIX)),
+            flush_prefixes=flush_prefixes,
             sd_filter=float(
                 sd_filter
                 if sd_filter is not None
@@ -308,4 +397,18 @@ def apply_baseline_recalc(
             ),
             iqr_multiplier=float(settings.get("IQR_multiplier", DEFAULT_IQR_MULTIPLIER)),
         )
+
+    # Derived quantities computed after all cells, e.g. SSA = scattering /
+    # recalculated extinction. Spec: {name: {Ratio: [a, b]}} or {Difference: [a, b]}.
+    for name, spec in (settings.get("Derived") or {}).items():
+        op, cols = next(iter(spec.items()))
+        if not all(c in df.columns for c in cols):
+            continue
+        a, b = pl.col(cols[0]), pl.col(cols[1])
+        if op.lower() == "ratio":
+            df = df.with_columns((a / b).alias(name))
+        elif op.lower() == "difference":
+            df = df.with_columns((a - b).alias(name))
+        else:
+            raise BaselineError(f"Derived {name!r}: unknown operation {op!r}")
     return df

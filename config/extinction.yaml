@@ -17,3 +17,21 @@ Units:
 Main_Plots:
   - Extinction
   - Loss
+
+# Method extinction: the corrected loss is reported directly in Mm-1 —
+# no span division or mixing-ratio conversion (that's the gas method).
+Baseline_Recalculation:
+  Method: extinction
+  Status_col: "Status"
+  Temperature_col: "Temperature"
+  Pressure_col: "Pressure"
+  Baseline_status_prefix: "32"
+  # Valve-transition (flush) rows: filtered-air contaminated but not baseline.
+  Flush_status_prefixes: ["31", "11"]
+  Baseline_sd_filter: 2.0   # Mm-1; typical PMex baseline loss SD is 0.5-0.9
+  IQR_multiplier: 1.5       # outlier cut inside each baseline period
+  Cells:
+    Extinction:
+      Loss_col: "Loss"
+      Span_col: "Span"               # cell span calibration; divides the corrected loss
+      Instrument_col: "Extinction"   # instrument's own value, for comparison plots

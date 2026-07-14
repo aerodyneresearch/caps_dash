@@ -16,7 +16,12 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-from baseline import BaselineError, apply_baseline_recalc, baseline_period_stats
+from baseline import (
+    BaselineError,
+    apply_baseline_recalc,
+    baseline_period_stats,
+    recalc_interp_col,
+)
 from lod import LOD_SIGMA_FACTOR, allan_deviation, baseline_lod_series
 from parser import CapsFile, read_caps_file
 
@@ -119,7 +124,9 @@ def load_drive_file(file_id: str) -> CapsFile:
 def recalc_baselines(
     _caps_file: CapsFile, cache_key: str, sd_filter: float | None = None
 ) -> pl.DataFrame:
-    return apply_baseline_recalc(_caps_file.data, _caps_file.config, sd_filter)
+    return apply_baseline_recalc(
+        _caps_file.data, _caps_file.config, sd_filter, parameters=_caps_file.parameters
+    )
 
 
 @st.cache_data(show_spinner="Preparing export...", max_entries=4)
@@ -303,27 +310,29 @@ def render_data_tab(caps_file: CapsFile) -> None:
         hide_baselines = False
         if "baseline_period" in df.columns:
             hide_baselines = st.toggle(
-                "Hide baseline periods",
+                "Measurement data only",
                 key="data_hide_baselines",
-                help="Exclude zero-air (baseline) rows from the plot and the "
-                "summary statistics. The raw data preview below is unaffected.",
+                help="Exclude zero-air (baseline) rows and valve-flush transition "
+                "rows from the plot and the summary statistics. The raw data "
+                "preview below is unaffected.",
             )
 
     if not selected_cols:
         st.warning("Select at least one column to plot.")
         return
 
+    regime_cols = [c for c in ("baseline_period", "flush_period") if c in df.columns]
     view_df = df
     if hide_baselines:
-        view_df = df.filter(pl.col("baseline_period") != 1)
+        view_df = df.filter(pl.all_horizontal([pl.col(c) != 1 for c in regime_cols]))
 
     plot_df = view_df
     if "Timestamp" in view_df.columns and avg_seconds > 1:
-        # Baseline (zero-air) and measurement rows are averaged separately, so
-        # a window spanning a valve switch never blends the two regimes into
-        # one point.
-        group = ["baseline_period"] if "baseline_period" in view_df.columns else None
-        agg_cols = [c for c in selected_cols if c != "baseline_period"]
+        # Baseline (zero-air), flush, and measurement rows are averaged
+        # separately, so a window spanning a valve switch never blends the
+        # regimes into one point.
+        group = regime_cols or None
+        agg_cols = [c for c in selected_cols if c not in regime_cols]
         plot_df = (
             view_df.drop_nulls("Timestamp")
             .sort("Timestamp")
@@ -351,11 +360,23 @@ def render_data_tab(caps_file: CapsFile) -> None:
         }
 
     has_regime = "baseline_period" in plot_df.columns
+    if has_regime:
+        is_base = pl.col("baseline_period") == 1
+        is_flush = (
+            pl.col("flush_period") == 1
+            if "flush_period" in plot_df.columns
+            else pl.lit(False)
+        )
+        regimes = [
+            ("Measurement", ~is_base & ~is_flush),
+            ("Baseline", is_base),
+            ("Flush", is_flush),
+        ]
     stats_rows = []
     for c in selected_cols:
-        if has_regime and c != "baseline_period":
-            for period, flag in [("Measurement", 0), ("Baseline", 1)]:
-                series = plot_df.filter(pl.col("baseline_period") == flag)[c]
+        if has_regime and c not in ("baseline_period", "flush_period"):
+            for period, mask in regimes:
+                series = plot_df.filter(mask)[c]
                 if series.drop_nulls().len():
                     stats_rows.append(stats_row(c, series, period))
         else:
@@ -417,15 +438,24 @@ def build_baseline_scan_figure(
 
 
 def build_concentration_pdf_figure(
-    df: pl.DataFrame, conc_orig: str, conc_recalc: str, baseline_period: int
+    df: pl.DataFrame, conc_orig: str, conc_recalc: str, regime: str,
+    x_title: str = "Concentration (ppb)",
 ) -> go.Figure:
     """Probability density of concentration during baseline or measurement rows.
 
-    Bin range comes from robust quantiles (0.5%–99.5% across both series, plus
-    padding) so a handful of outliers can't stretch the bins; excluded points
-    are counted in an annotation rather than silently dropped.
+    regime is "baseline" or "measurement"; measurement excludes valve-flush
+    transition rows. Bin range comes from robust quantiles (0.5%–99.5% across
+    both series, plus padding) so a handful of outliers can't stretch the
+    bins; excluded points are counted in an annotation rather than silently
+    dropped.
     """
-    rows = df.filter(pl.col("baseline_period") == baseline_period)
+    if regime == "baseline":
+        cond = pl.col("baseline_period") == 1
+    else:
+        cond = pl.col("baseline_period") != 1
+        if "flush_period" in df.columns:
+            cond &= pl.col("flush_period") != 1
+    rows = df.filter(cond)
     series = {
         f"Instrument ({conc_orig})": (rows[conc_orig].drop_nulls(), PLOTLY_COLORS[0]),
         f"Recalculated ({conc_recalc})": (rows[conc_recalc].drop_nulls(), PLOTLY_COLORS[1]),
@@ -465,7 +495,7 @@ def build_concentration_pdf_figure(
     fig.update_layout(
         barmode="overlay",
         height=400,
-        xaxis_title="Concentration (ppb)",
+        xaxis_title=x_title,
         yaxis_title="Probability density",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         margin={"t": 40},
@@ -539,17 +569,25 @@ def render_baseline_tab(caps_file: CapsFile) -> None:
             )
 
     st.subheader("Concentration distributions")
-    conc_orig = cell.get("Concentration_col") or f"Concentration_{species}"
-    conc_recalc = f"concentration_{species}_interp"
+    conc_orig = (
+        cell.get("Instrument_col")
+        or cell.get("Concentration_col")
+        or f"Concentration_{species}"
+    )
+    conc_recalc = recalc_interp_col(settings, species)
     missing = [c for c in (conc_orig, conc_recalc) if c not in df.columns]
     if missing:
         st.info(f"Columns not available for the distribution plots: {missing}")
         return
+    pdf_unit = column_unit(conc_orig, caps_file.config).replace("<sup>-1</sup>", "⁻¹") or "?"
+    pdf_x_title = f"{conc_orig} ({pdf_unit})"
     pdf_base_col, pdf_meas_col = st.columns(2)
     with pdf_base_col:
         st.markdown("**Baseline (zero-air) periods**")
         st.plotly_chart(
-            build_concentration_pdf_figure(df, conc_orig, conc_recalc, baseline_period=1),
+            build_concentration_pdf_figure(
+                df, conc_orig, conc_recalc, regime="baseline", x_title=pdf_x_title
+            ),
             width="stretch",
             key=f"fig_pdf_base_{species}",
         )
@@ -560,7 +598,9 @@ def render_baseline_tab(caps_file: CapsFile) -> None:
     with pdf_meas_col:
         st.markdown("**Measurement periods**")
         st.plotly_chart(
-            build_concentration_pdf_figure(df, conc_orig, conc_recalc, baseline_period=0),
+            build_concentration_pdf_figure(
+                df, conc_orig, conc_recalc, regime="measurement", x_title=pdf_x_title
+            ),
             width="stretch",
             key=f"fig_pdf_meas_{species}",
         )
@@ -571,7 +611,7 @@ def render_baseline_tab(caps_file: CapsFile) -> None:
         )
 
 
-def build_lod_timeseries_figure(series: dict[str, pl.DataFrame]) -> go.Figure:
+def build_lod_timeseries_figure(series: dict[str, pl.DataFrame], unit: str) -> go.Figure:
     """LOD (3*SD of baseline concentration) per baseline period, over time."""
     fig = go.Figure()
     for idx, (label, s) in enumerate(series.items()):
@@ -589,14 +629,14 @@ def build_lod_timeseries_figure(series: dict[str, pl.DataFrame]) -> go.Figure:
     fig.update_layout(
         height=380,
         xaxis_title="Time (UTC)",
-        yaxis_title="LOD, 3σ (ppb)",
+        yaxis_title=f"LOD, 3σ ({unit})",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         margin={"t": 40},
     )
     return fig
 
 
-def build_allan_figure(curves: dict[str, pl.DataFrame], as_lod: bool) -> go.Figure:
+def build_allan_figure(curves: dict[str, pl.DataFrame], as_lod: bool, unit: str) -> go.Figure:
     """Allan-Werle deviation vs averaging time, log-log, with a white-noise guide."""
     factor = LOD_SIGMA_FACTOR if as_lod else 1.0
     fig = go.Figure()
@@ -622,7 +662,7 @@ def build_allan_figure(curves: dict[str, pl.DataFrame], as_lod: bool) -> go.Figu
                 marker={"size": 6},
             )
         )
-    y_title = "LOD, 3σ (ppb)" if as_lod else "Allan deviation, σ (ppb)"
+    y_title = f"LOD, 3σ ({unit})" if as_lod else f"Allan deviation, σ ({unit})"
     fig.update_layout(
         height=420,
         xaxis={"type": "log", "title": {"text": "Averaging time (s)"}},
@@ -649,8 +689,13 @@ def render_lod_tab(caps_file: CapsFile) -> None:
             "threshold (the ones flagged bad on the Baseline Recalc tab).",
         )
     cell = cells[species]
-    conc_orig = cell.get("Concentration_col") or f"Concentration_{species}"
-    conc_recalc = f"concentration_{species}_interp"
+    conc_orig = (
+        cell.get("Instrument_col")
+        or cell.get("Concentration_col")
+        or f"Concentration_{species}"
+    )
+    conc_recalc = recalc_interp_col(settings, species)
+    unit = column_unit(conc_orig, caps_file.config).replace("<sup>-1</sup>", "⁻¹") or "?"
 
     df = caps_file.data
     recalc_error = None
@@ -681,10 +726,12 @@ def render_lod_tab(caps_file: CapsFile) -> None:
             st.info("No baseline periods with enough points for an SD.")
         else:
             st.plotly_chart(
-                build_lod_timeseries_figure(series), width="stretch", key=f"fig_lod_ts_{species}"
+                build_lod_timeseries_figure(series, unit),
+                width="stretch",
+                key=f"fig_lod_ts_{species}",
             )
             medians = ", ".join(
-                f"{label}: {s['lod'].median():.3f} ppb" for label, s in series.items()
+                f"{label}: {s['lod'].median():.3f} {unit}" for label, s in series.items()
             )
             excluded_note = ""
             if exclude_bad:
@@ -785,14 +832,14 @@ def render_lod_tab(caps_file: CapsFile) -> None:
     if not curves:
         return
     st.plotly_chart(
-        build_allan_figure(curves, as_lod), width="stretch", key=f"fig_allan_{species}"
+        build_allan_figure(curves, as_lod, unit), width="stretch", key=f"fig_allan_{species}"
     )
     factor = LOD_SIGMA_FACTOR if as_lod else 1.0
     best_parts = []
     for label, curve in curves.items():
         best = curve.sort("adev").row(0, named=True)
         best_parts.append(
-            f"{label}: {best['adev'] * factor:.4f} ppb at τ = {best['tau']:.0f} s"
+            f"{label}: {best['adev'] * factor:.4f} {unit} at τ = {best['tau']:.0f} s"
         )
     st.caption(
         f"{seg.height:,} samples at {dt:g} s spacing. "
@@ -858,7 +905,7 @@ def render_export_sidebar(caps_file: CapsFile) -> None:
                 "the SD threshold (any cell).",
             )
             drop_baselines = st.checkbox(
-                "Drop all baseline rows (measurement only)",
+                "Drop baseline + flush rows (measurement only)",
                 key="export_drop_baselines",
             )
 
@@ -871,7 +918,10 @@ def render_export_sidebar(caps_file: CapsFile) -> None:
                 )
                 out = out.filter(~in_bad_baseline.fill_null(False))
         if drop_baselines:
-            out = out.filter(pl.col("baseline_period") != 1)
+            cond = pl.col("baseline_period") != 1
+            if "flush_period" in out.columns:
+                cond &= pl.col("flush_period") != 1
+            out = out.filter(cond)
 
         fmt = st.radio("Format", ["CSV", "Parquet"], horizontal=True, key="export_fmt")
         stem = Path(caps_file.name).stem

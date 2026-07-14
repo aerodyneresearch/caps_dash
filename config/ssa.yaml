@@ -19,7 +19,37 @@ Units:
   RawScat: "counts"
   SDR: ""
   WCRef: ""
+  SSA_recalc: ""
+  Absorption_recalc: "Mm<sup>-1</sup>"
 
 Main_Plots:
   - Extinction
   - Scattering
+
+# The extinction cell is recalculated from the raw loss (Method extinction);
+# Scattering is already baseline-subtracted and cross-calibrated by the
+# instrument at measurement time, so it is used as-is in the derived
+# quantities below.
+Baseline_Recalculation:
+  Method: extinction
+  Status_col: "Status"
+  Temperature_col: "Temperature"
+  Pressure_col: "Pressure"
+  Baseline_status_prefix: "32"
+  # Valve-transition (flush) rows: filtered-air contaminated but not baseline.
+  Flush_status_prefixes: ["31", "11"]
+  Baseline_sd_filter: 1.0   # Mm-1; typical PMssa baseline loss SD is 0.2-0.35
+  IQR_multiplier: 1.5       # outlier cut inside each baseline period
+  Cells:
+    Extinction:
+      Loss_col: "Loss"
+      # PMssa files don't log the extinction-cell span as a column; it sits at
+      # token 25 (1-indexed) of the metadata parameter block (0.73 in the
+      # sample file). Span_value: <x> would override it as a constant.
+      Span_parameter_index: 25
+      Instrument_col: "Extinction"   # instrument's own value, for comparison plots
+  Derived:
+    SSA_recalc:
+      Ratio: ["Scattering", "Extinction_recalc_interp"]
+    Absorption_recalc:
+      Difference: ["Extinction_recalc_interp", "Scattering"]

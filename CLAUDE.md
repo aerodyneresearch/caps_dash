@@ -43,6 +43,13 @@ This is a Python port of an older R/Quarto dashboard (`caps_functions.R` /
   wavelength codes) stay in `baseline.py`. Bad baselines are *flagged*
   (`baseline_good_<species>`), not removed — the recalc math still excludes
   them internally, so numeric outputs stay identical to R.
+  Two output methods share the pipeline core: `Method: gas` (NO2/NOx —
+  span-divided, ppb at STP) and `Method: extinction` (PMex/PMssa —
+  span-divided Mm⁻¹, no gas conversion; span from `Span_col`,
+  `Span_parameter_index` into the metadata block, or `Span_value`).
+  `Derived:` entries (Ratio/Difference) compute e.g. PMssa SSA after the
+  cells run. Any change to the shared core must be re-proven bit-for-bit
+  against R (scratchpad harness: run reference R via Rscript, compare).
 
 ## Workflow notes
 
