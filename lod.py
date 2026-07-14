@@ -21,14 +21,17 @@ LOD_SIGMA_FACTOR = 3.0
 
 
 def baseline_lod_series(
-    df: pl.DataFrame, conc_col: str, min_points: int = 3
+    df: pl.DataFrame, conc_col: str, min_points: int = 3, good_col: str | None = None
 ) -> pl.DataFrame:
     """LOD (3*SD of conc_col) per baseline period; one row per period.
 
     Periods with fewer than min_points samples are dropped — a two-point SD
-    is not an LOD estimate.
+    is not an LOD estimate. Pass good_col (a baseline_good_<species> flag
+    column) to exclude baseline periods flagged bad by the SD threshold.
     """
     base = df.filter(pl.col("baseline_period") == 1)
+    if good_col is not None and good_col in base.columns:
+        base = base.filter(pl.col(good_col))
     aggs = [pl.len().alias("n"), pl.col(conc_col).std().alias("sd")]
     if "Timestamp" in base.columns:
         aggs.append(pl.col("Timestamp").min().alias("start"))

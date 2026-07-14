@@ -27,6 +27,11 @@ Main_Plots:
   - Concentration_NO2
   - Concentration_NOx
 
+# Direct-instrument logs name some columns differently than logged .dat
+# files; these are renamed to the canonical names at parse time.
+Rename:
+  Status1: Status
+
 # Rows whose Status_col value starts with Baseline_status_prefix are baseline
 # periods (both cells share one valve, so Status drives detection for both).
 # Each cell's Status_col (last digit) selects that cell's LED wavelength.

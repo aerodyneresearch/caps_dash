@@ -279,13 +279,16 @@ def apply_baseline_recalc(
     cells = settings.get("Cells")
     if not cells:
         raise BaselineError("Config has no Baseline_Recalculation.Cells section")
-    missing = [
-        c
-        for c in (settings.get("Status_col"), settings.get("Temperature_col"), settings.get("Pressure_col"))
-        if c and c not in df.columns
-    ]
+    required = [settings.get("Status_col"), settings.get("Temperature_col"), settings.get("Pressure_col")]
+    for cell in cells.values():
+        required += [cell.get("Loss_col"), cell.get("Span_col"), cell.get("Status_col")]
+    missing = sorted({c for c in required if c and c not in df.columns})
     if missing:
-        raise BaselineError(f"Columns not found in data: {missing}")
+        raise BaselineError(
+            f"Columns required by the config are not in the data: {missing}. "
+            "If the instrument type was guessed, the guess may be wrong — or this "
+            "file uses different column names than the config expects."
+        )
 
     for species, cell in cells.items():
         df = baseline_recalc(

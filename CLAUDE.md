@@ -17,14 +17,21 @@ This is a Python port of an older R/Quarto dashboard (`caps_functions.R` /
   them on secondary axes; multiple grids make the plot unreadable.
   If a request ever needs 4+ units at once, prefer switching to stacked
   subplots with a shared x-axis over adding more overlaid axes.
-- **Instrument detection**: first digit of the serial number at position 32
-  (1-indexed) of the `%`-prefixed parameter block (see `INSTRUMENT_TYPES` in
-  `parser.py`). The parameter block is kept as raw string tokens because some
-  positions hold dates — do not convert it to floats.
+- **Instrument detection is a chain** (see `read_caps_file` in `parser.py`):
+  parameter block serial number (authoritative; first digit of token 32,
+  1-indexed) → exact CSV-header match against each config's `Header:` →
+  fuzzy column-similarity guess. `CapsFile.detection_method`/`detection_note`
+  record which step fired, and the app shows it (caption for the first two,
+  st.info for guesses, st.warning for unknown). The parameter block is kept
+  as raw string tokens because some positions hold dates — do not convert it
+  to floats.
 - Traces use `Scattergl` above `WEBGL_THRESHOLD` rows (files are often
   50k+ rows at 1 Hz); keep that when touching the plot code.
-- `example_data/` contains `.log` files the app never lists (it globs
-  `**/*.dat` only); they are raw instrument logs kept for reference.
+- The app lists/accepts both `.dat` (acquisition-PC logs) and `.log`
+  (direct-instrument output). Direct logs differ: comma decimal separator in
+  Timestamp fractions (normalized in `parser.py` before CSV parsing),
+  dash-format dates, and some renamed columns — canonicalized via the
+  config's `Rename:` mapping (e.g. `Status1` → `Status` for NOx).
 - **`baseline.py` is a faithful port of
   `reference/baseline_recalculation_functions_v2.R`** — validated bit-for-bit
   (~1e-13) against R on `example_data/Baseline_Recalc/`. It deliberately
@@ -43,5 +50,5 @@ This is a Python port of an older R/Quarto dashboard (`caps_functions.R` /
   (started outside the agent). Don't kill it; run verification servers on
   another port. Streamlit ignores the `PORT` env var — pass
   `--server.port` explicitly.
-- Python 3.11 venv at `.venv/`; on this machine bare `python` is not on
-  PATH — use `.venv/Scripts/python.exe`.
+- Python 3.14 venv at `venv/` (the old `.venv/` was removed); on this
+  machine bare `python` is not on PATH — use `venv/Scripts/python.exe`.
