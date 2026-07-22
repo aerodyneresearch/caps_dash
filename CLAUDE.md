@@ -27,6 +27,14 @@ This is a Python port of an older R/Quarto dashboard (`caps_functions.R` /
   to floats.
 - Traces use `Scattergl` above `WEBGL_THRESHOLD` rows (files are often
   50k+ rows at 1 Hz); keep that when touching the plot code.
+- **The main Data-tab time series is min/max-decimated to ~`PLOT_POINT_TARGET`
+  points before plotting** (`decimate_for_plot`). A full day at 1 Hz is ~86k
+  points → 7 MB of JSON to the browser, and no screen has that many pixels;
+  decimation cuts the payload ~11x with spikes preserved (per-bucket argmin
+  and argmax of every plotted column are kept). Only the *figure* is
+  decimated — statistics, averaging and export always use the full data.
+  This is what keeps file load/render well under the 10 s target on a warm
+  server. Don't feed raw high-res frames straight to `st.plotly_chart`.
 - The app lists/accepts both `.dat` (acquisition-PC logs) and `.log`
   (direct-instrument output). Direct logs differ: comma decimal separator in
   Timestamp fractions (normalized in `parser.py` before CSV parsing),

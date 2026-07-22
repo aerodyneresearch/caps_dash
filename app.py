@@ -17,6 +17,7 @@ import polars as pl
 import streamlit as st
 
 from baseline import (
+    DEFAULT_BASELINE_SD_FILTER,
     BaselineError,
     apply_baseline_recalc,
     baseline_period_stats,
@@ -69,7 +70,7 @@ def extract_drive_file_id(link: str) -> str | None:
     return link if re.fullmatch(r"[-\w]{10,}", link) else None
 
 
-DRIVE_DATA_EXTENSIONS = (".dat", ".log", ".txt", ".csv")
+DATA_EXTENSIONS = (".dat", ".log", ".txt", ".csv")
 
 
 def parse_drive_folder_listing(html: str) -> list[tuple[str, str]]:
@@ -91,14 +92,13 @@ def list_drive_folder(folder_id: str) -> list[tuple[str, str]]:
     resp.raise_for_status()
     files = parse_drive_folder_listing(resp.text)
     return sorted(
-        (f for f in files if f[1].lower().endswith(DRIVE_DATA_EXTENSIONS)),
+        (f for f in files if f[1].lower().endswith(DATA_EXTENSIONS)),
         key=lambda f: f[1],
     )
 
 
-@st.cache_data(show_spinner="Downloading from Google Drive...", max_entries=4)
-def load_drive_file(file_id: str) -> CapsFile:
-    """Download a link-shared Drive file and parse it as a CAPS file."""
+def download_drive_bytes(file_id: str) -> tuple[bytes, str]:
+    """Download a link-shared Drive file; returns (content, filename)."""
     resp = requests.get(
         "https://drive.usercontent.google.com/download",
         params={"id": file_id, "export": "download", "confirm": "t"},
@@ -115,9 +115,34 @@ def load_drive_file(file_id: str) -> CapsFile:
     name = f"drive_{file_id}.dat"
     if m := re.search(r'filename="([^"]+)"', resp.headers.get("Content-Disposition", "")):
         name = m.group(1)
-    buffer = io.BytesIO(resp.content)
+    return resp.content, name
+
+
+@st.cache_data(show_spinner="Downloading from Google Drive...", max_entries=4)
+def load_drive_file(file_id: str) -> CapsFile:
+    """Download a link-shared Drive file and parse it as a CAPS file."""
+    content, name = download_drive_bytes(file_id)
+    buffer = io.BytesIO(content)
     buffer.name = name
     return read_caps_file(buffer)
+
+
+def config_sd_default(caps_file: CapsFile) -> float:
+    settings = (caps_file.config or {}).get("Baseline_Recalculation") or {}
+    return float(settings.get("Baseline_sd_filter", DEFAULT_BASELINE_SD_FILTER))
+
+
+def shared_sd_filter(caps_file: CapsFile) -> float:
+    """The session-wide baseline SD filter (Mm⁻¹).
+
+    Set via the Baseline Recalc tab's input and consumed by every recalc in
+    the app (Data tab, LOD tab, export); reset to the instrument config's
+    default whenever a different file is loaded.
+    """
+    if st.session_state.get("sd_filter_file") != caps_file.name:
+        st.session_state["sd_filter_file"] = caps_file.name
+        st.session_state["sd_filter_shared"] = config_sd_default(caps_file)
+    return st.session_state["sd_filter_shared"]
 
 
 @st.cache_data(show_spinner="Recalculating baselines...", max_entries=8)
@@ -144,6 +169,40 @@ def column_unit(col: str, config: dict | None) -> str:
         return str(units[col])
     low = col.lower()
     return next((unit for pattern, unit in UNIT_PATTERNS if pattern in low), "")
+
+
+PLOT_POINT_TARGET = 4000
+
+
+def decimate_for_plot(
+    df: pl.DataFrame, cols: list[str], target: int = PLOT_POINT_TARGET
+) -> tuple[pl.DataFrame, bool]:
+    """Min/max downsample rows for display without distorting the trace shape.
+
+    A day of 1 Hz data is ~86k points, but no screen has that many pixels, so
+    sending them all just bloats the browser payload. We bucket the rows and
+    keep, per bucket, the argmin and argmax row of every plotted column — so
+    every spike survives — plus each bucket's first row for continuity. Only
+    the figure uses this; statistics and export keep the full data.
+
+    Returns (frame, decimated?).
+    """
+    n = df.height
+    numeric = [c for c in cols if df.schema.get(c) in NUMERIC_DTYPES]
+    if n <= target or not numeric:
+        return df, False
+    bucket = max(1, n * 2 // target)
+    f = df.with_row_index("_ri").with_columns((pl.col("_ri") // bucket).alias("_b"))
+    keep: set[int] = set()
+    for c in numeric:
+        agg = f.drop_nulls(c).group_by("_b").agg(
+            pl.col("_ri").gather(pl.col(c).arg_min()).first().alias("lo"),
+            pl.col("_ri").gather(pl.col(c).arg_max()).first().alias("hi"),
+            pl.col("_ri").first().alias("first"),
+        )
+        for name in ("lo", "hi", "first"):
+            keep.update(int(i) for i in agg[name].drop_nulls().to_list())
+    return df[sorted(keep)], True
 
 
 def build_timeseries_figure(
@@ -220,13 +279,44 @@ def build_timeseries_figure(
 
 def pick_data_source() -> CapsFile | None:
     st.sidebar.title("CAPS Dashboard")
-    mode = st.sidebar.radio("Data source", ["Upload file", "Example data", "Google Drive link"])
+    mode = st.sidebar.radio(
+        "Data source", ["Upload file", "Local folder", "Example data", "Google Drive link"]
+    )
 
     if mode == "Upload file":
         uploaded = st.sidebar.file_uploader(
             "Select CAPS output file", type=["dat", "log", "txt", "csv"]
         )
         return load_caps_file(uploaded) if uploaded is not None else None
+
+    if mode == "Local folder":
+        with st.sidebar:
+            folder = folder_input(
+                "Folder path",
+                key="source_folder",
+                help=r"Folder containing CAPS files, e.g. C:\data\campaign",
+            )
+        if not folder:
+            return None
+        root = Path(folder).expanduser()
+        if not root.is_dir():
+            st.sidebar.error("That folder doesn't exist (or isn't a folder).")
+            return None
+        recursive = st.sidebar.checkbox("Include subfolders", key="folder_recursive")
+        files = sorted(
+            p
+            for p in root.glob("**/*" if recursive else "*")
+            if p.is_file() and p.suffix.lower() in DATA_EXTENSIONS
+        )
+        if not files:
+            st.sidebar.info("No data files (.dat/.log/.txt/.csv) in that folder.")
+            return None
+        choice = st.sidebar.selectbox(
+            f"File in folder ({len(files)} found)",
+            files,
+            format_func=lambda p: p.relative_to(root).as_posix(),
+        )
+        return load_caps_file(str(choice)) if choice else None
 
     if mode == "Google Drive link":
         link = st.sidebar.text_input(
@@ -291,8 +381,15 @@ def render_data_tab(caps_file: CapsFile) -> None:
     # whenever the config supports it; without usable baselines the raw
     # columns are shown as-is.
     if (caps_file.config or {}).get("Baseline_Recalculation"):
+        sd_filter = shared_sd_filter(caps_file)
         try:
-            df = recalc_baselines(caps_file, f"{caps_file.name}:{df.height}")
+            df = recalc_baselines(caps_file, f"{caps_file.name}:{df.height}", sd_filter)
+            if sd_filter != config_sd_default(caps_file):
+                st.caption(
+                    f"Baselines recalculated with SD filter {sd_filter:g} Mm⁻¹ "
+                    f"(set on the Baseline Recalc tab; config default "
+                    f"{config_sd_default(caps_file):g})."
+                )
         except BaselineError as exc:
             st.caption(f"Baseline recalculation unavailable for this file: {exc}")
 
@@ -341,9 +438,16 @@ def render_data_tab(caps_file: CapsFile) -> None:
             .sort("Timestamp")
         )
 
-    fig = build_timeseries_figure(plot_df, selected_cols, caps_file.config)
+    figure_df, decimated = decimate_for_plot(plot_df, selected_cols)
+    fig = build_timeseries_figure(figure_df, selected_cols, caps_file.config)
     with plot_col:
         st.plotly_chart(fig, width="stretch")
+        if decimated:
+            st.caption(
+                f"Plot downsampled to {figure_df.height:,} of {plot_df.height:,} points "
+                "for responsiveness (min/max — spikes preserved). Statistics, export "
+                "and averaging use the full data."
+            )
 
     st.subheader("Summary statistics")
 
@@ -511,13 +615,15 @@ def render_baseline_tab(caps_file: CapsFile) -> None:
     with species_col:
         species = st.selectbox("Cell / species", list(cells))
     with sd_col:
+        shared_sd_filter(caps_file)  # seed/reset the shared value for this file
         sd_filter = st.number_input(
             "SD filter (Mm⁻¹)",
             min_value=0.01,
-            value=float(settings.get("Baseline_sd_filter", 0.3)),
             step=0.05,
+            key="sd_filter_shared",
             help="Baseline periods whose loss SD is at or above this are flagged "
-            "bad and excluded from the recalculation.",
+            "bad and excluded from the recalculation. Applies everywhere: Data "
+            "tab, LOD tab, and export.",
         )
 
     try:
@@ -700,7 +806,9 @@ def render_lod_tab(caps_file: CapsFile) -> None:
     df = caps_file.data
     recalc_error = None
     try:
-        df = recalc_baselines(caps_file, f"{caps_file.name}:{caps_file.data.height}")
+        df = recalc_baselines(
+            caps_file, f"{caps_file.name}:{caps_file.data.height}", shared_sd_filter(caps_file)
+        )
     except BaselineError as exc:
         recalc_error = exc
     have_baselines = "baseline_period" in df.columns and bool(df["baseline_period"].sum())
@@ -876,6 +984,52 @@ def render_detection_banner(caps_file: CapsFile) -> None:
                 "or baseline analysis.")
 
 
+def pick_folder_dialog() -> str | None:
+    """Native folder-picker dialog. Works because the Streamlit server runs on
+    the user's own machine; returns None on headless setups or cancel."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory()
+        root.destroy()
+        return path or None
+    except Exception:
+        return None
+
+
+def folder_input(label: str, key: str, **text_kwargs) -> str:
+    """Text input for a folder path with a native Browse... button beside it."""
+    text_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
+    # The button is handled before the text_input is instantiated so the
+    # picked path can be written into the widget's session state.
+    if btn_col.button("Browse", key=f"{key}_browse"):
+        if picked := pick_folder_dialog():
+            st.session_state[key] = str(Path(picked))
+    return text_col.text_input(label, key=key, **text_kwargs).strip().strip('"')
+
+
+def apply_row_filters(df: pl.DataFrame, drop_bad: bool, drop_baselines: bool) -> pl.DataFrame:
+    """Row filters shared by the export panel and batch processing."""
+    out = df
+    if drop_bad:
+        flags = [c for c in out.columns if c.startswith("baseline_good_")]
+        if flags:
+            in_bad_baseline = (pl.col("baseline_period") == 1) & pl.any_horizontal(
+                [~pl.col(f) for f in flags]
+            )
+            out = out.filter(~in_bad_baseline.fill_null(False))
+    if drop_baselines:
+        cond = pl.col("baseline_period") != 1
+        if "flush_period" in out.columns:
+            cond &= pl.col("flush_period") != 1
+        out = out.filter(cond)
+    return out
+
+
 def render_export_sidebar(caps_file: CapsFile) -> None:
     """Sidebar download of the (recalculated) dataframe, with row filters."""
     with st.sidebar:
@@ -886,7 +1040,9 @@ def render_export_sidebar(caps_file: CapsFile) -> None:
         recalc_ok = False
         if (caps_file.config or {}).get("Baseline_Recalculation"):
             try:
-                df = recalc_baselines(caps_file, f"{caps_file.name}:{df.height}")
+                df = recalc_baselines(
+                    caps_file, f"{caps_file.name}:{df.height}", shared_sd_filter(caps_file)
+                )
                 recalc_ok = True
             except BaselineError:
                 pass
@@ -909,19 +1065,7 @@ def render_export_sidebar(caps_file: CapsFile) -> None:
                 key="export_drop_baselines",
             )
 
-        out = df
-        if drop_bad:
-            flags = [c for c in out.columns if c.startswith("baseline_good_")]
-            if flags:
-                in_bad_baseline = (pl.col("baseline_period") == 1) & pl.any_horizontal(
-                    [~pl.col(f) for f in flags]
-                )
-                out = out.filter(~in_bad_baseline.fill_null(False))
-        if drop_baselines:
-            cond = pl.col("baseline_period") != 1
-            if "flush_period" in out.columns:
-                cond &= pl.col("flush_period") != 1
-            out = out.filter(cond)
+        out = apply_row_filters(df, drop_bad, drop_baselines)
 
         fmt = st.radio("Format", ["CSV", "Parquet"], horizontal=True, key="export_fmt")
         stem = Path(caps_file.name).stem
@@ -936,6 +1080,164 @@ def render_export_sidebar(caps_file: CapsFile) -> None:
             mime="application/octet-stream" if fmt == "Parquet" else "text/csv",
             width="stretch",
         )
+
+
+def process_one_file(
+    source, out_path: Path, fmt: str, drop_bad: bool, drop_baselines: bool,
+    sd_filter: float | None = None,
+) -> tuple[str, str]:
+    """Parse + recalculate + filter + write one file (path or file-like).
+    Returns (status, note)."""
+    caps = read_caps_file(source)
+    df = caps.data
+    status = "ok"
+    note = f"{caps.instrument_type or 'unknown type'}"
+    if (caps.config or {}).get("Baseline_Recalculation"):
+        try:
+            df = apply_baseline_recalc(
+                df, caps.config, sd_filter, parameters=caps.parameters
+            )
+            note += ", recalculated"
+        except BaselineError as exc:
+            status = "no recalc"
+            note += f" — {exc}"
+    else:
+        status = "no recalc"
+        note += " — no recalculation configured for this instrument"
+    df = apply_row_filters(df, drop_bad, drop_baselines)
+    if fmt == "Parquet":
+        df.write_parquet(out_path)
+    else:
+        df.write_csv(out_path, datetime_format="%Y-%m-%d %H:%M:%S%.3f")
+    return status, f"{df.height:,} rows — {note}"
+
+
+def render_batch_sidebar() -> None:
+    """Process every data file in a folder, writing <name>_processed outputs."""
+    with st.sidebar.expander("Batch processing"):
+        source = st.radio(
+            "Input source", ["Local folder", "Google Drive folder"],
+            horizontal=True, key="batch_src",
+        )
+        if source == "Local folder":
+            in_dir = folder_input("Input folder", key="batch_in")
+            recursive = st.checkbox("Include subfolders", key="batch_recursive")
+        else:
+            drive_link = st.text_input(
+                "Drive folder share link",
+                key="batch_drive_link",
+                help="Folder shared as 'Anyone with the link'.",
+            ).strip()
+        out_dir = folder_input(
+            "Output folder",
+            key="batch_out",
+            help="Local folder for the processed files. To land them in Google "
+            "Drive, pick a folder synced by Google Drive for Desktop — direct "
+            "API upload would need OAuth credentials.",
+        )
+        fmt = st.radio("Format", ["CSV", "Parquet"], horizontal=True, key="batch_fmt")
+        drop_bad = st.checkbox("Drop rows in flagged (bad) baselines", key="batch_drop_bad")
+        drop_baselines = st.checkbox(
+            "Drop baseline + flush rows (measurement only)", key="batch_drop_baselines"
+        )
+        overwrite = st.checkbox(
+            "Overwrite existing outputs",
+            key="batch_overwrite",
+            help="Off: files whose output already exists are skipped, so re-running "
+            "a batch only processes new files.",
+        )
+        sd_override = st.number_input(
+            "SD filter override (0 = config default)",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            key="batch_sd_override",
+            help="Baseline SD threshold in Mm⁻¹ applied to every file in this "
+            "batch. Use when files report 'all baseline periods flagged bad' and "
+            "the observed SDs in the note justify a higher threshold.",
+        )
+
+        if st.button("Process folder", key="batch_go", width="stretch"):
+            dest = Path(out_dir).expanduser()
+            if not out_dir or not dest.is_dir():
+                st.error("Output folder doesn't exist.")
+                return
+
+            # Work list: (display name, loader) pairs from either source.
+            # Loaders are lazy so skipped Drive files are never downloaded.
+            if source == "Local folder":
+                root = Path(in_dir).expanduser()
+                if not in_dir or not root.is_dir():
+                    st.error("Input folder doesn't exist.")
+                    return
+                work = [
+                    (p.name, lambda p=p: str(p))
+                    for p in sorted(root.glob("**/*" if recursive else "*"))
+                    if p.is_file()
+                    and p.suffix.lower() in DATA_EXTENSIONS
+                    and not p.stem.endswith("_processed")  # never re-ingest outputs
+                ]
+            else:
+                folder = re.search(r"/folders/([-\w]{10,})", drive_link or "")
+                if not folder:
+                    st.error("That doesn't look like a Drive folder link.")
+                    return
+                try:
+                    listing = list_drive_folder(folder.group(1))
+                except Exception as exc:
+                    st.error(f"Could not list folder: {exc}")
+                    return
+
+                def drive_loader(file_id):
+                    def load():
+                        content, name = download_drive_bytes(file_id)
+                        buffer = io.BytesIO(content)
+                        buffer.name = name
+                        return buffer
+                    return load
+
+                work = [
+                    (name, drive_loader(fid))
+                    for fid, name in listing
+                    if not Path(name).stem.endswith("_processed")
+                ]
+            if not work:
+                st.info("No data files (.dat/.log/.txt/.csv) found in the input.")
+                return
+
+            ext = ".parquet" if fmt == "Parquet" else ".csv"
+            progress = st.progress(0.0, text="Processing...")
+            results = []
+            for i, (name, loader) in enumerate(work):
+                out_path = dest / f"{Path(name).stem}_processed{ext}"
+                if out_path.exists() and not overwrite:
+                    results.append({"File": name, "Status": "skipped", "Note": "output exists"})
+                else:
+                    try:
+                        status, note = process_one_file(
+                            loader(), out_path, fmt, drop_bad, drop_baselines,
+                            sd_filter=sd_override or None,
+                        )
+                        results.append({"File": name, "Status": status, "Note": note})
+                    except Exception as exc:  # keep the batch going on bad files
+                        results.append({"File": name, "Status": "FAILED", "Note": str(exc)[:200]})
+                progress.progress((i + 1) / len(work), text=f"{i + 1}/{len(work)} {name}")
+            st.session_state["batch_results"] = results
+
+        if results := st.session_state.get("batch_results"):
+            n = {s: sum(r["Status"] == s for r in results) for s in
+                 ("ok", "no recalc", "skipped", "FAILED")}
+            st.caption(
+                f"Last batch: {n['ok']} recalculated, {n['no recalc']} written "
+                f"without recalculation, {n['skipped']} skipped, {n['FAILED']} failed."
+            )
+            if n["no recalc"] or n["FAILED"]:
+                st.warning(
+                    f"{n['no recalc'] + n['FAILED']} file(s) were not recalculated — "
+                    "see the Note column for why (e.g. baseline SDs above the "
+                    "config threshold)."
+                )
+            st.dataframe(results, width="stretch", height=200)
 
 
 def render_metadata_tab(caps_file: CapsFile) -> None:
@@ -980,6 +1282,7 @@ def main() -> None:
 
     caps_file = pick_data_source()
     if caps_file is None:
+        render_batch_sidebar()
         st.title("CAPS Analysis Dashboard")
         st.info("Load a CAPS output file from the sidebar to begin.")
         return
@@ -987,6 +1290,7 @@ def main() -> None:
     st.title(f"CAPS Analysis — {caps_file.name}")
     render_detection_banner(caps_file)
     render_export_sidebar(caps_file)
+    render_batch_sidebar()
     if caps_file.data.height == 0:
         st.warning("The file parsed but contains no data rows — only a header.")
     recalc_available = bool(

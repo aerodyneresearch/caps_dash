@@ -253,9 +253,22 @@ def baseline_recalc(
     try:
         df = assign_baseline_number(df)
     except BaselineError:
+        # Tell the user what the data actually looks like, so they can judge
+        # whether to raise the threshold rather than just seeing a refusal.
+        mask = all_period == 1
+        sds = df.get_column(f"sd_loss_baseline_{loss_col}").filter(mask).drop_nulls()
+        n_periods = all_number.filter(mask).n_unique()
+        detail = (
+            f" — observed baseline loss SDs run {sds.min():.3g}-{sds.max():.3g} Mm^-1"
+            f" (median {sds.median():.3g})"
+            if sds.len()
+            else ""
+        )
         raise BaselineError(
-            f"All {species} baseline periods were flagged bad "
-            f"(loss SD >= {sd_filter:g} Mm^-1); nothing to recalculate from"
+            f"All {n_periods} {species} baseline periods were flagged bad at the "
+            f"{sd_filter:g} Mm^-1 SD threshold{detail}. If these baselines are "
+            "usable, raise Baseline_sd_filter in the instrument config (or the "
+            "SD filter on the Baseline Recalc tab)."
         ) from None
     df, rayleigh_col = assign_rayleigh(df, led_status_col or status_col, temperature_col, pressure_col)
     df = recalculate_baseline_loss(df, loss_col, rayleigh_col, iqr_multiplier)
